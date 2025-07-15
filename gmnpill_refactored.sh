@@ -6,7 +6,7 @@ set -euo pipefail
 # ===== Configuration =====
 # --- Static ---
 readonly SCRIPT_NAME=$(basename "$0")
-readonly SCRIPT_VERSION="4.2 (jq enforced)"
+readonly SCRIPT_VERSION="4.3 (Configurable Total)"
 readonly TIMESTAMP=$(date +%s)
 readonly RANDOM_CHARS=$(head /dev/urandom | tr -dc 'a-z0-9' | head -c 4)
 readonly EMAIL_USERNAME="momo${RANDOM_CHARS}${TIMESTAMP:(-4)}"
@@ -451,19 +451,30 @@ configure_settings() {
         echo "                     配置参数"
         echo "======================================================"
         echo "当前设置:"
-        echo "1. 项目前缀:             $PROJECT_PREFIX"
-        echo "2. 最大并行任务数:         $MAX_PARALLEL_JOBS"
-        echo "3. 最大重试次数:         $MAX_RETRY_ATTEMPTS"
-        echo "4. 全局等待时间 (秒):    $GLOBAL_WAIT_SECONDS"
+        echo "1. 项目创建数量:         $TOTAL_PROJECTS"
+        echo "2. 项目前缀:             $PROJECT_PREFIX"
+        echo "3. 最大并行任务数:         $MAX_PARALLEL_JOBS"
+        echo "4. 最大重试次数:         $MAX_RETRY_ATTEMPTS"
+        echo "5. 全局等待时间 (秒):    $GLOBAL_WAIT_SECONDS"
         echo ""
         echo "0. 返回主菜单"
         echo "======================================================"
         
         local setting_choice
-        read -p "请选择要修改的参数 [0-4]: " setting_choice
+        read -p "请选择要修改的参数 [0-5]: " setting_choice
 
         case $setting_choice in
-            1) 
+            1)
+                read -p "新的项目创建数量 (例如 1-50): " new_total
+                if [[ "$new_total" =~ ^[1-9][0-9]*$ ]]; then
+                    TOTAL_PROJECTS=$new_total
+                    log_success "项目创建数量已更新。"
+                else
+                    log_warn "无效数字，未更新。"
+                fi
+                sleep 1
+                ;;
+            2) 
                 read -p "新项目前缀 (小写字母,数字,连字符,字母开头,最多20字符): " new_prefix
                 if [[ -n "$new_prefix" && "$new_prefix" =~ ^[a-z][a-z0-9-]{0,19}$ ]]; then
                     PROJECT_PREFIX="$new_prefix"
@@ -473,7 +484,7 @@ configure_settings() {
                 fi
                 sleep 1
                 ;;
-            2) 
+            3) 
                 read -p "新的最大并行任务数 (例如 10-100): " new_parallel
                 if [[ "$new_parallel" =~ ^[1-9][0-9]*$ ]]; then
                     MAX_PARALLEL_JOBS=$new_parallel
@@ -483,7 +494,7 @@ configure_settings() {
                 fi
                 sleep 1
                 ;;
-            3) 
+            4) 
                 read -p "新的最大重试次数 (例如 1-5): " new_retries
                 if [[ "$new_retries" =~ ^[1-9][0-9]*$ ]]; then
                     MAX_RETRY_ATTEMPTS=$new_retries
@@ -493,7 +504,7 @@ configure_settings() {
                 fi
                 sleep 1
                 ;;
-            4) 
+            5) 
                 read -p "新的全局等待时间 (秒, 例如 60-120): " new_wait
                 if [[ "$new_wait" =~ ^[1-9][0-9]*$ ]]; then
                     GLOBAL_WAIT_SECONDS=$new_wait
