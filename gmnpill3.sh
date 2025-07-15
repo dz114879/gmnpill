@@ -23,7 +23,6 @@ readonly TIMESTAMP=$(date +%s)
 readonly RANDOM_CHARS=$(head /dev/urandom | tr -dc 'a-z0-9' | head -c 4)
 readonly EMAIL_USERNAME="momo${RANDOM_CHARS}${TIMESTAMP:(-4)}"
 readonly PURE_KEY_FILE="key.txt"
-readonly COMMA_SEPARATED_KEY_FILE="comma_separated_keys_${EMAIL_USERNAME}.txt"
 readonly DELETION_LOG="project_deletion_$(date +%Y%m%d_%H%M%S).log"
 readonly TEMP_DIR="/tmp/gcp_script_${TIMESTAMP}"
 SECONDS=0 # 用于计时
@@ -50,17 +49,11 @@ log() { _log_internal "$1" "$2"; }
 
 # JSON 解析 (优先使用 jq)
 parse_json() {
-  local json="$1" field="$2" value=""
-  if ! command -v jq &> /dev/null; then
-    # 备用方法: sed/grep
-    case "$field" in
-      ".keyString") value=$(echo "$json" | sed -n 's/.*"keyString": *"\([^"]*\)".*/\1/p');;
-      *) local field_name; field_name=$(echo "$field" | tr -d '.["]'); value=$(echo "$json" | grep -oP "(?<=\"$field_name\":\s*\")[^\"]*");;
-    esac
-  else
-    # 首选方法: jq
-    value=$(echo "$json" | jq -r "$field")
-  fi
+  local json="$1" field="$2"
+  local value
+  
+  # jq 是必需的，直接使用
+  value=$(echo "$json" | jq -r "$field")
   
   if [[ -n "$value" && "$value" != "null" ]]; then
     echo "$value"
@@ -122,11 +115,6 @@ write_keys_to_files() {
     (
         flock 200
         echo "$api_key" >> "$PURE_KEY_FILE"
-        # 如果文件非空，则先加逗号
-        if [[ -s "$COMMA_SEPARATED_KEY_FILE" ]]; then
-            echo -n "," >> "$COMMA_SEPARATED_KEY_FILE"
-        fi
-        echo -n "$api_key" >> "$COMMA_SEPARATED_KEY_FILE"
     ) 200>"${TEMP_DIR}/key_files.lock"
 }
 
@@ -158,7 +146,7 @@ task_enable_api() {
 
 task_create_key() {
     local project_id="$1"
-    local cmd="gcloud services api-keys create --project=\"$project_id\" --display-name=\"Gemini API Key for $project_id\" --format=\"json\" --quiet"
+    local cmd="gcloud services api-keys create --project=\"$project_id\" --display-name=\"Gemini API Key for $project_id\" --format=\"json\" --quiet 2>/dev/null"
     
     local create_output
     if ! create_output=$(retry_with_backoff $MAX_RETRY_ATTEMPTS "$cmd"); then
@@ -211,7 +199,7 @@ run_parallel() {
     
     # 导出所需函数和变量，以便 xargs 的子shell可以访问
     export -f "$task_func" log _log_internal retry_with_backoff parse_json write_keys_to_files show_progress
-    export MAX_RETRY_ATTEMPTS PURE_KEY_FILE COMMA_SEPARATED_KEY_FILE TEMP_DIR DELETION_LOG
+    export MAX_RETRY_ATTEMPTS PURE_KEY_FILE TEMP_DIR DELETION_LOG
     
     local success_results=()
     # 使用 mapfile 和进程替换直接从 xargs 的输出中读取结果
@@ -250,7 +238,7 @@ create_projects_and_get_keys() {
     log "INFO" "脚本将在 3 秒后开始执行..."; sleep 3
 
     # --- 准备工作 ---
-    > "$PURE_KEY_FILE"; > "$COMMA_SEPARATED_KEY_FILE"
+    > "$PURE_KEY_FILE"
     
     # --- 阶段 0: 生成项目ID列表 ---
     local projects_to_create=()
@@ -297,7 +285,7 @@ create_projects_and_get_keys() {
     local successful_keys; successful_keys=$(wc -l < "$PURE_KEY_FILE" | xargs)
     generate_report "$successful_keys" "$TOTAL_PROJECTS"
     log "INFO" "======================================================"
-    log "INFO" "请检查文件 '$PURE_KEY_FILE' 和 '$COMMA_SEPARATED_KEY_FILE' 中的内容"
+    log "INFO" "请检查文件 '$PURE_KEY_FILE' 中的内容"
     if (( successful_keys < TOTAL_PROJECTS )); then
         log "WARN" "有 $((TOTAL_PROJECTS - successful_keys)) 个项目未能成功获取密钥，请检查上方日志了解详情。"
     fi
@@ -371,7 +359,6 @@ generate_report() {
   echo "总执行时间: $minutes 分 $seconds_rem 秒"
   echo "API密钥已保存至:"
   echo "- 纯API密钥 (每行一个): $PURE_KEY_FILE"
-  echo "- 逗号分隔密钥 (单行): $COMMA_SEPARATED_KEY_FILE"
   echo "=========================="
 }
 
@@ -476,8 +463,24 @@ main() {
         log "INFO" "GCP 项目配置检查完成。"
     fi
     
-    if ! command -v jq > /dev/null; then
-        log "INFO" "未找到 'jq' 命令，将使用 sed/grep 解析JSON。建议安装 'jq' 以提高可靠性。"
+    if ! command -v jq &> /dev/null; then
+        log "WARN" "未找到 'jq' 命令，正在尝试自动安装..."
+        if command -v apt-get &> /dev/null; then
+            sudo apt-get update && sudo apt-get install -y jq
+        elif command -v yum &> /dev/null; then
+            sudo yum install -y jq
+        elif command -v brew &> /dev/null; then
+            brew install jq
+        else
+            log "ERROR" "无法确定包管理器 (apt/yum/brew)。请手动安装 'jq' 后再运行脚本。"
+            exit 1
+        fi
+        if ! command -v jq &> /dev/null; then
+            log "ERROR" "安装 'jq' 失败。请手动安装后重试。"
+            exit 1
+        else
+            log "INFO" "'jq' 安装成功。"
+        fi
     else
         log "INFO" "检测到 'jq'，将用于JSON解析。"
     fi
