@@ -3,12 +3,12 @@
 # ===== 配置 =====
 # 自动生成随机用户名
 TIMESTAMP=$(date +%s)
-RANDOM_CHARS=$(tr -dc 'a-z0-9' < /dev/urandom | head -c 4)
-EMAIL_USERNAME="KK${RANDOM_CHARS}${TIMESTAMP:(-4)}TsM"
+RANDOM_CHARS=$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 4 | head -n 1)
+EMAIL_USERNAME="KK${RANDOM_CHARS}${TIMESTAMP:(-4)}TsN"
 PROJECT_PREFIX="hajimi-miyc"
 ### MODIFICATION ###: Project count is now fixed at 50 as requested.
-TOTAL_PROJECTS=75  # 创建50个项目
-MAX_PARALLEL_JOBS=25  # 默认设置为40 (可根据机器性能和网络调整)
+TOTAL_PROJECTS=75  # 创建75个项目
+MAX_PARALLEL_JOBS=15  # 默认设置为15 (可根据机器性能和网络调整)
 GLOBAL_WAIT_SECONDS=75 # 创建项目和启用API之间的全局等待时间 (秒)
 MAX_RETRY_ATTEMPTS=3  # 重试次数
 # 只保留纯密钥和逗号分隔密钥文件
@@ -25,6 +25,7 @@ _log_internal() {
   local level=$1; local msg=$2; local timestamp; timestamp=$(date '+%Y-%m-%d %H:%M:%S')
   echo "[$timestamp] [$level] $msg"
 }
+_log_internal "INFO" "JSON 解析将仅使用备用方法 (sed/grep)。"
 # ===== 初始化结束 =====
 
 # ===== 工具函数 =====
@@ -52,90 +53,90 @@ write_keys_to_files() {
 }
 
 retry_with_backoff() {
-  local max_attempts=$1 cmd=$2 attempt=1 timeout=5 error_msg
+  local max_attempts=$1; local cmd=$2; local attempt=1; local timeout=5; local error_log="${TEMP_DIR}/error_$RANDOM.log"
   while [ $attempt -le $max_attempts ]; do
-    if error_msg=$(bash -c "$cmd" 2>&1); then return 0; fi
+    if bash -c "$cmd" 2>"$error_log"; then rm -f "$error_log"; return 0; fi
+    local error_msg=$(cat "$error_log")
     if [[ "$error_msg" == *"Permission denied"* || "$error_msg" == *"Authentication failed"* ]]; then
-        log "ERROR" "权限或认证错误，停止重试。"; return 1
+        log "ERROR" "权限或认证错误，停止重试。"; rm -f "$error_log"; return 1;
     fi
     if [ $attempt -lt $max_attempts ]; then sleep $timeout; timeout=$((timeout * 2)); fi
     attempt=$((attempt + 1))
   done
-  log "ERROR" "命令在 $max_attempts 次尝试后最终失败。最后错误: $error_msg"; return 1
+  log "ERROR" "命令在 $max_attempts 次尝试后最终失败。最后错误: $(cat "$error_log")"; rm -f "$error_log"; return 1
 }
 
 show_progress() {
-    local completed=$1 total=$2
-    [ $total -le 0 ] && return
-    [ $completed -gt $total ] && completed=$total
+    local completed=$1; local total=$2; if [ $total -le 0 ]; then return; fi
+    if [ $completed -gt $total ]; then completed=$total; fi
     local percent=$((completed * 100 / total))
-    local filled=$((percent / 2))
-    printf "\r[%*s%*s] %d%% (%d/%d)" $filled "" $((50-filled)) "" "$percent" "$completed" "$total" | tr ' ' '#'
+    local completed_chars=$((percent * 50 / 100))
+    local remaining_chars=$((50 - completed_chars))
+    local progress_bar=$(printf "%${completed_chars}s" "" | tr ' ' '#')
+    local remaining_bar=$(printf "%${remaining_chars}s" "")
+    printf "\r[%s%s] %d%% (%d/%d)" "$progress_bar" "$remaining_bar" "$percent" "$completed" "$total"
 }
 
 generate_report() {
   local success=$1; local attempted=$2
   local failed=$((attempted - success))
-  echo ""; echo "========== 执行完毕 =========="
-  echo "计划获取: $attempted 个密钥"
-  echo "成功获取: $success 个"
+  echo ""; echo "========== 执行报告 =========="
+  echo "计划目标: $attempted 个项目"
+  echo "成功获取密钥: $success 个"
   echo "失败: $failed 个"
-  echo "密钥已保存至:"
+  echo "API密钥已保存至:"
   echo "- 每行一个: $PURE_KEY_FILE"
   echo "- 逗号分隔: $COMMA_SEPARATED_KEY_FILE"
   echo "=========================="
 }
 
 task_create_project() {
-    local project_id="$1" success_file="$2" error_msg
-    if error_msg=$(gcloud projects create "$project_id" --name="$project_id" --no-set-as-default --quiet 2>&1); then
-        (flock 200; echo "$project_id" >> "$success_file") 200>"${success_file}.lock"
-        return 0
+    local project_id="$1"; local success_file="$2"; local error_log="${TEMP_DIR}/create_${project_id}_error.log"
+    if gcloud projects create "$project_id" --name="$project_id" --no-set-as-default --quiet >/dev/null 2>"$error_log"; then
+        (flock 200; echo "$project_id" >> "$success_file";) 200>"${success_file}.lock"
+        rm -f "$error_log"; return 0
     else
-        log "ERROR" "创建项目失败: $project_id: $error_msg"
-        return 1
+        log "ERROR" "创建项目失败: $project_id: $(cat "$error_log")"
+        rm -f "$error_log"; return 1
     fi
 }
 
 task_enable_api() {
-    local project_id="$1" success_file="$2"
-    if retry_with_backoff $MAX_RETRY_ATTEMPTS "gcloud services enable generativelanguage.googleapis.com --project=\"$project_id\" --quiet"; then
-        (flock 200; echo "$project_id" >> "$success_file") 200>"${success_file}.lock"
-        return 0
+    local project_id="$1"; local success_file="$2"; local error_log="${TEMP_DIR}/enable_${project_id}_error.log"
+    if retry_with_backoff $MAX_RETRY_ATTEMPTS "gcloud services enable generativelanguage.googleapis.com --project=\"$project_id\" --quiet 2>\"$error_log\""; then
+        (flock 200; echo "$project_id" >> "$success_file";) 200>"${success_file}.lock"
+        rm -f "$error_log"; return 0
     else
-        log "ERROR" "启用API失败: $project_id"
-        return 1
+        log "ERROR" "启用API失败: $project_id: $(cat "$error_log")"
+        rm -f "$error_log"; return 1
     fi
 }
 
 task_create_key() {
-    local project_id="$1" create_output api_key
-    if create_output=$(retry_with_backoff $MAX_RETRY_ATTEMPTS "gcloud services api-keys create --project=\"$project_id\" --display-name=\"Gemini API Key for $project_id\" --format=\"json\" --quiet"); then
-        api_key=$(parse_json "$create_output" ".keyString")
-        if [ -n "$api_key" ]; then
-            write_keys_to_files "$api_key"
-            return 0
-        else
-            log "ERROR" "提取密钥失败: $project_id (无法从gcloud输出解析keyString)"
-            return 1
-        fi
+    local project_id="$1"; local error_log="${TEMP_DIR}/key_${project_id}_error.log"; local create_output
+    if ! create_output=$(retry_with_backoff $MAX_RETRY_ATTEMPTS "gcloud services api-keys create --project=\"$project_id\" --display-name=\"Gemini API Key for $project_id\" --format=\"json\" --quiet 2>\"$error_log\""); then
+        log "ERROR" "创建密钥失败: $project_id: $(cat "$error_log")"
+        rm -f "$error_log"; return 1
+    fi
+    local api_key; api_key=$(parse_json "$create_output" ".keyString")
+    if [ -n "$api_key" ]; then
+        write_keys_to_files "$api_key"; rm -f "$error_log"; return 0
     else
-        log "ERROR" "创建密钥失败: $project_id"
-        return 1
+        log "ERROR" "提取密钥失败: $project_id (无法从gcloud输出解析keyString)"
+        rm -f "$error_log"; return 1
     fi
 }
 
 delete_project() {
-  local project_id="$1" error_msg timestamp
-  timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-  if error_msg=$(gcloud projects delete "$project_id" --quiet 2>&1); then
+  local project_id="$1"; local error_log="${TEMP_DIR}/delete_${project_id}_error.log"
+  if gcloud projects delete "$project_id" --quiet 2>"$error_log"; then
     log "SUCCESS" "成功删除项目: $project_id"
-    ( flock 201; echo "[$timestamp] 已删除: $project_id" >> "$DELETION_LOG" ) 201>"${TEMP_DIR}/${DELETION_LOG}.lock"
-    return 0
+    ( flock 201; echo "[$(date '+%Y-%m-%d %H:%M:%S')] 已删除: $project_id" >> "$DELETION_LOG"; ) 201>"${TEMP_DIR}/${DELETION_LOG}.lock"
+    rm -f "$error_log"; return 0
   else
-    log "ERROR" "删除项目失败: $project_id: $error_msg"
-    ( flock 201; echo "[$timestamp] 删除失败: $project_id - $error_msg" >> "$DELETION_LOG" ) 201>"${TEMP_DIR}/${DELETION_LOG}.lock"
-    return 1
+    log "ERROR" "删除项目失败: $project_id: $(cat "$error_log")"
+    ( flock 201; echo "[$(date '+%Y-%m-%d %H:%M:%S')] 删除失败: $project_id - $(cat "$error_log")" >> "$DELETION_LOG"; ) 201>"${TEMP_DIR}/${DELETION_LOG}.lock"
+    rm -f "$error_log"; return 1
   fi
 }
 
@@ -161,12 +162,16 @@ run_parallel() {
         show_progress $completed_count $total_items; echo -n " $description 中 (S:$success_count F:$fail_count)..."
     done
     echo; log "INFO" "阶段 '$description' 完成。成功: $success_count, 失败: $fail_count"
+    log "INFO" "======================================================"
     if [ $fail_count -gt 0 ]; then return 1; else return 0; fi
 }
 
 create_projects_and_get_keys_fast() {
     SECONDS=0
+    log "INFO" "======================================================"
     log "INFO" "任务: 创建固定的 $TOTAL_PROJECTS 个项目并获取API密钥"
+    log "INFO" "======================================================"
+    ### MODIFICATION ###: Quota check is removed.
     log "INFO" "使用随机生成的用户名: ${EMAIL_USERNAME}"
     log "INFO" "在 3 秒后开始执行..."; sleep 3
 
@@ -175,12 +180,8 @@ create_projects_and_get_keys_fast() {
     for i in $(seq 1 $TOTAL_PROJECTS); do
         local project_num=$(printf "%03d" $i)
         local base_id="${PROJECT_PREFIX}-${EMAIL_USERNAME}-${project_num}"
-        local project_id=${base_id//[^a-z0-9-]/}
-        project_id=${project_id:0:30}
-        project_id=${project_id%-}
-        [[ "$project_id" =~ ^[a-z] ]] || project_id="g${project_id:1}"
-        project_id=${project_id:0:30}
-        project_id=${project_id%-}
+        local project_id=$(echo "$base_id" | tr -cd 'a-z0-9-' | cut -c 1-30 | sed 's/-$//')
+        if ! [[ "$project_id" =~ ^[a-z] ]]; then project_id="g${project_id:1}"; project_id=$(echo "$project_id" | cut -c 1-30 | sed 's/-$//'); fi
         projects_to_create+=("$project_id")
     done
 
@@ -194,7 +195,7 @@ create_projects_and_get_keys_fast() {
     # --- PHASE 2: Global Wait ---
     log "INFO" "阶段2: 全局等待 ${GLOBAL_WAIT_SECONDS} 秒，以便GCP后端同步项目状态..."
     for ((i=1; i<=${GLOBAL_WAIT_SECONDS}; i++)); do sleep 1; show_progress $i ${GLOBAL_WAIT_SECONDS}; echo -n " 等待中..."; done
-    echo; log "INFO" "等待完成。"
+    echo; log "INFO" "等待完成。"; log "INFO" "======================================================"
 
     # --- PHASE 3: Enable APIs ---
     local ENABLED_PROJECTS_FILE="${TEMP_DIR}/enabled_projects.txt"; > "$ENABLED_PROJECTS_FILE"
@@ -210,21 +211,22 @@ create_projects_and_get_keys_fast() {
     # --- FINAL REPORT ---
     local successful_keys=$(wc -l < "$PURE_KEY_FILE" | xargs)
     generate_report "$successful_keys" "$TOTAL_PROJECTS"
+    log "INFO" "======================================================"
     log "INFO" "请检查文件 '$PURE_KEY_FILE' 和 '$COMMA_SEPARATED_KEY_FILE' 中的内容"
     if [ "$successful_keys" -lt "$TOTAL_PROJECTS" ]; then log "WARN" "有 $((TOTAL_PROJECTS - successful_keys)) 个项目未能成功获取密钥，请检查上方日志了解详情。"; fi
     log "INFO" "本脚本原版作者类脑@ddddd1996, 修改版作者类脑@KKTsN, 感谢您的使用"
+    log "INFO" "======================================================"
 }
 
 delete_all_existing_projects() {
   SECONDS=0
-  log "INFO" "功能2: 删除所有现有项目"
-  log "INFO" "正在获取项目列表..."
-  local ALL_PROJECTS=($(gcloud projects list --format="value(projectId)" --filter="projectId!~^sys-" --quiet 2>/dev/null))
-  if [ $? -ne 0 ]; then log "ERROR" "无法获取项目列表"; return 1; fi
+  log "INFO" "======================================================"; log "INFO" "功能2: 删除所有现有项目"; log "INFO" "======================================================"
+  log "INFO" "正在获取项目列表..."; local list_error="${TEMP_DIR}/list_projects_error.log"; local ALL_PROJECTS=($(gcloud projects list --format="value(projectId)" --filter="projectId!~^sys-" --quiet 2>"$list_error")); local list_ec=$?; rm -f "$list_error"
+  if [ $list_ec -ne 0 ]; then log "ERROR" "无法获取项目列表: $(cat "$list_error")"; return 1; fi
   if [ ${#ALL_PROJECTS[@]} -eq 0 ]; then log "INFO" "未找到任何用户项目，无需删除"; return 0; fi
   local total_to_delete=${#ALL_PROJECTS[@]}
   log "INFO" "找到 $total_to_delete 个用户项目需要删除";
-  read -p "!!! 危险操作 !!! 确认要删除所有 $total_to_delete 个项目吗？(输入 'YES' 确认): " confirm; if [ "$confirm" != "YES" ]; then log "INFO" "删除操作已取消"; return 1; fi
+  read -p "!!! 危险操作 !!! 确认要删除所有 $total_to_delete 个项目吗？(输入 'DELETE-ALL' 确认): " confirm; if [ "$confirm" != "DELETE-ALL" ]; then log "INFO" "删除操作已取消"; return 1; fi
   echo "项目删除日志 ($(date +%Y-%m-%d_%H:%M:%S))" > "$DELETION_LOG"; echo "------------------------------------" >> "$DELETION_LOG"
   export -f delete_project log retry_with_backoff show_progress; export DELETION_LOG TEMP_DIR MAX_PARALLEL_JOBS MAX_RETRY_ATTEMPTS
   run_parallel delete_project "删除项目" "/dev/null" "${ALL_PROJECTS[@]}"
@@ -243,7 +245,7 @@ show_menu() {
   echo "\____/   \____/  /_/      /_/ /_/   \___/  /_/  / .___/   \___/  /_/     "
   echo "                                               /_/                            "             
   echo "GCP 项目&密钥管理工具 修改版 v1 By momo & ddddd1996 & KKTsN"
-  echo "================================"
+  echo "======================================================"
   local current_account; current_account=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null | head -n 1); if [ -z "$current_account" ]; then current_account="无法获取"; fi
   local current_project; current_project=$(gcloud config get-value project 2>/dev/null); if [ -z "$current_project" ]; then current_project="未设置"; fi
   echo "当前账号: $current_account"; echo "当前项目: $current_project"
@@ -253,7 +255,7 @@ show_menu() {
   echo "2. 一键删除所有现有项目"
   echo "3. 修改配置参数"
   echo "0. 退出"
-  echo "================================"
+  echo "======================================================"
   read -p "请输入选项 [0-3]: " choice
 
   case $choice in
@@ -268,7 +270,7 @@ show_menu() {
 
 configure_settings() {
   while true; do
-      clear; echo "配置参数"; echo "========"
+      clear; echo "======================================================"; echo "配置参数"; echo "======================================================"
       echo "当前设置:";
       echo "1. 项目创建数量: $TOTAL_PROJECTS"
       echo "2. 项目前缀 (用于新建项目): $PROJECT_PREFIX"
@@ -276,7 +278,7 @@ configure_settings() {
       echo "4. 最大重试次数 (用于API调用): $MAX_RETRY_ATTEMPTS"
       echo "5. 全局等待时间 (秒): $GLOBAL_WAIT_SECONDS"
       echo "0. 返回主菜单"
-      echo "========"
+      echo "======================================================"
       ### MODIFICATION ###: Added TOTAL_PROJECTS configuration option
       read -p "请选择要修改的设置 [0-5]: " setting_choice
       case $setting_choice in
