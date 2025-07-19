@@ -1,558 +1,335 @@
-#!/usr/bin/env bash
-###############################################################################
-# GCP 项目 & Gemini API Key 批量管理脚本 (优化版)
-# 原始作者: 类脑 @momo & @ddddd1996  修改作者: 类脑 @KKTsN
-# 优化重构: (本版本) Apple 风格强化版
-# 版本: v2.0
-#
-# 主要改进说明:
-# 1. 并行调度修复: 原 run_parallel 使用 wait -n 后又对每个 PID 二次 wait，存在统计不准确潜在风险。
-#    新实现采用 “启动 -> 记录PID -> 统一等待” 模式，逻辑更清晰，避免重复 wait。
-# 2. 解析增强: 移除对 grep -P (在 macOS 默认不可用) 的依赖；优先使用 jq（若已安装），否则使用 sed 纯文本解析。
-# 3. 可靠重试: retry_with_backoff 引入随机抖动 (jitter)，避免多个并发重试雪崩。
-# 4. 跨平台锁: 移除对 flock 的硬依赖（macOS 无该命令）；改为 mkdir 原子目录锁，兼容 Linux/macOS。
-# 5. 更安全随机: 使用 < /dev/urandom + tr + head -c，减少不必要的 cat 和 pipe。
-# 6. 可选 CLI 参数: 支持非交互模式 (示例: ./5_optimized.sh --create -c 50 -j 20)。
-# 7. 日志系统: 彩色输出（TTY 时启用），结构化时间戳 + 级别；支持 NO_COLOR 关闭。
-# 8. 资源清理: trap 统一清理临时目录和心跳进程。
-# 9. 键文件写入: 使用原子锁，确保高并发写入不交叉。
-# 10. 可维护性: 模块分层、函数职责明确、变量命名规范、增加帮助说明。
-# 11. 性能细节: 减少多余子进程 / subshell；控制并发检查采用 jobs -rp；只在需要时启动心跳。
-# 12. 用户体验: 菜单更清晰；新增 --yes 跳过危险操作确认；进度行实时刷新。
-# 13. 错误可诊断: 更聚焦的错误输出，保留失败场景上下文；重试过程中权限/认证错误立即中止。
-# 14. 可扩展性: 增加配置入口 (环境变量 + CLI + 菜单)，支持脚本在自动化流水线中复用。
-#
-# 禁用彩色输出: NO_COLOR=1 ./5_optimized.sh --create
-###############################################################################
+#!/bin/bash
 
-# ========================== 安全与基础设置 ===========================
-# 不使用 set -e 以便精细控制每一步错误；保留 pipefail 捕获管道错误
-set -o pipefail
-IFS=$'\n\t'
-
-# ========================== 颜色与日志系统 ===========================
-if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
-  COLOR_INFO='\033[34m'
-  COLOR_WARN='\033[33m'
-  COLOR_ERROR='\033[31m'
-  COLOR_SUCCESS='\033[32m'
-  COLOR_HEART='\033[35m'
-  COLOR_RESET='\033[0m'
-else
-  COLOR_INFO='' COLOR_WARN='' COLOR_ERROR='' COLOR_SUCCESS='' COLOR_HEART='' COLOR_RESET=''
-fi
-
-log() {
-  # 用法: log LEVEL MESSAGE
-  local level=$1; shift
-  local msg=$*
-  local ts shell_level col
-  ts=$(date '+%Y-%m-%d %H:%M:%S')
-  case "$level" in
-    INFO)    col=$COLOR_INFO ;;
-    WARN)    col=$COLOR_WARN ;;
-    ERROR)   col=$COLOR_ERROR ;;
-    SUCCESS) col=$COLOR_SUCCESS ;;
-    HEARTBEAT) col=$COLOR_HEART ;;
-    *)       col=$COLOR_INFO ;;
-  esac
-  printf '[%s] [%s%s%s] %s\n' "$ts" "$col" "$level" "$COLOR_RESET" "$msg"
-}
-
-# ========================== 全局配置 (可被 CLI / 菜单 / 环境覆盖) ===========================
-API_NAME="generativelanguage.googleapis.com"
-DEFAULT_TOTAL_PROJECTS=${TOTAL_PROJECTS:-75}       # 可被 --count 覆盖
-DEFAULT_MAX_PARALLEL=${MAX_PARALLEL_JOBS:-15}
-DEFAULT_GLOBAL_WAIT=${GLOBAL_WAIT_SECONDS:-75}
-DEFAULT_MAX_RETRIES=${MAX_RETRY_ATTEMPTS:-3}
-PROJECT_PREFIX=${PROJECT_PREFIX:-"hajimi-miyc"}
-
-# 运行时变量
-TOTAL_PROJECTS=$DEFAULT_TOTAL_PROJECTS
-MAX_PARALLEL_JOBS=$DEFAULT_MAX_PARALLEL
-GLOBAL_WAIT_SECONDS=$DEFAULT_GLOBAL_WAIT
-MAX_RETRY_ATTEMPTS=$DEFAULT_MAX_RETRIES
-AUTO_CONFIRM_DELETE=false
-NON_INTERACTIVE_ACTION=""   # create | delete | ""
-
-# 临时目录 + 结果文件
-RUN_TIMESTAMP=$(date +%s)
-TEMP_DIR=$(mktemp -d -t gcp_script_${RUN_TIMESTAMP}.XXXXXX 2>/dev/null || echo "/tmp/gcp_script_${RUN_TIMESTAMP}")
-mkdir -p "$TEMP_DIR"
-EMAIL_RANDOM=$(tr -dc 'a-z0-9' < /dev/urandom | head -c 4)
-EMAIL_USERNAME="KK${EMAIL_RANDOM}${RUN_TIMESTAMP:(-4)}TsN"
+# ===== 配置 =====
+# 自动生成随机用户名
+TIMESTAMP=$(date +%s)
+RANDOM_CHARS=$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 4 | head -n 1)
+EMAIL_USERNAME="KK${RANDOM_CHARS}${TIMESTAMP:(-4)}TsN"
+PROJECT_PREFIX="hajimi-miyc"
+### MODIFICATION ###: Project count is now fixed at 50 as requested.
+TOTAL_PROJECTS=75  # 创建75个项目
+MAX_PARALLEL_JOBS=40  # 默认设置为40 (可根据机器性能和网络调整)
+GLOBAL_WAIT_SECONDS=75 # 创建项目和启用API之间的全局等待时间 (秒)
+MAX_RETRY_ATTEMPTS=3  # 重试次数
+# 只保留纯密钥和逗号分隔密钥文件
 PURE_KEY_FILE="key.txt"
 COMMA_SEPARATED_KEY_FILE="comma_separated_keys_${EMAIL_USERNAME}.txt"
-DELETION_LOG="project_deletion_$(date +%Y%m%d_%H%M%S).log"
 SECONDS=0
-HEARTBEAT_PID=""
+DELETION_LOG="project_deletion_$(date +%Y%m%d_%H%M%S).log"
+TEMP_DIR="/tmp/gcp_script_${TIMESTAMP}"
+# ===== 配置结束 =====
 
-# ========================== 清理机制 ===========================
-cleanup() {
-  if [ -n "$HEARTBEAT_PID" ] && kill -0 "$HEARTBEAT_PID" 2>/dev/null; then
-    kill "$HEARTBEAT_PID" 2>/dev/null || true
-    wait "$HEARTBEAT_PID" 2>/dev/null || true
-  fi
-  [ -d "$TEMP_DIR" ] && rm -rf "$TEMP_DIR"
+# ===== 初始化 =====
+mkdir -p "$TEMP_DIR"
+_log_internal() {
+  local level=$1; local msg=$2; local timestamp; timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+  echo "[$timestamp] [$level] $msg"
 }
-trap cleanup EXIT INT TERM
+_log_internal "INFO" "JSON 解析将仅使用备用方法 (sed/grep)。"
+# ===== 初始化结束 =====
 
-# ========================== 心跳机制 ===========================
+# ===== 工具函数 =====
+log() { _log_internal "$1" "$2"; }
+
+# 心跳机制函数
+HEARTBEAT_PID=""
 start_heartbeat() {
-  local message="$1"; local interval=${2:-15}
-  stop_heartbeat
-  (
-    while true; do
-      log HEARTBEAT "$message"
-      sleep "$interval" || break
-    done
-  ) &
-  HEARTBEAT_PID=$!
+    local message="$1"
+    local interval="${2:-30}"  # 默认30秒
+    
+    # 如果已有心跳进程，先停止它
+    stop_heartbeat
+    
+    # 启动新的心跳进程
+    (
+        while true; do
+            log "HEARTBEAT" "${message:-"等待..."}"
+            sleep "$interval"
+        done
+    ) &
+    HEARTBEAT_PID=$!
+    log "INFO" "心跳机制已启动 (PID: $HEARTBEAT_PID, 间隔: ${interval}秒)"
 }
 
 stop_heartbeat() {
-  if [ -n "$HEARTBEAT_PID" ] && kill -0 "$HEARTBEAT_PID" 2>/dev/null; then
-    kill "$HEARTBEAT_PID" 2>/dev/null || true
-    wait "$HEARTBEAT_PID" 2>/dev/null || true
-  fi
-  HEARTBEAT_PID=""
-}
-
-# ========================== 依赖检测 ===========================
-require_command() {
-  local cmd=$1
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    log ERROR "缺少依赖命令: $cmd (请先安装)"
-    return 1
-  fi
-  return 0
-}
-
-preflight_checks() {
-  require_command gcloud || exit 1
-  # jq 可选，不强制
-  if ! gcloud auth list --filter=status:ACTIVE --format="value(account)" >/dev/null 2>&1; then
-    log WARN "未检测到已登录账号，尝试执行 gcloud auth login ..."
-    if ! gcloud auth login; then
-      log ERROR "gcloud 登录失败，退出。"
-      exit 1
+    if [ -n "$HEARTBEAT_PID" ] && kill -0 "$HEARTBEAT_PID" 2>/dev/null; then
+        kill "$HEARTBEAT_PID" 2>/dev/null
+        wait "$HEARTBEAT_PID" 2>/dev/null || true
+        log "INFO" "心跳机制已停止 (PID: $HEARTBEAT_PID)"
     fi
-  fi
-  if ! gcloud config get-value project >/dev/null 2>&1; then
-    log WARN "未设置默认项目 (可忽略)。建议: gcloud config set project <PROJECT_ID>"
-  fi
+    HEARTBEAT_PID=""
 }
 
-# ========================== JSON 解析 (keyString) ===========================
-parse_key_string() {
-  # 输入: JSON 字符串 (包含 keyString 字段)
-  local json="$1"
+parse_json() {
+  local json="$1"; local field="$2"; local value=""
   if [ -z "$json" ]; then return 1; fi
-  if command -v jq >/dev/null 2>&1; then
-    local v</PROJECT_ID>
-    v=$(jq -r '.keyString // empty' 2>/dev/null <<<"$json") || true
-    if [ -n "$v" ]; then
-      printf '%s\n' "$v"
-      return 0
-    fi
-  fi
-  # sed 回退方案 (兼容 macOS)
-  local sed_val
-  sed_val=$(printf '%s' "$json" | sed -n 's/.*"keyString"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-  [ -n "$sed_val" ] && printf '%s\n' "$sed_val"
-  [ -n "$sed_val" ]
+  case "$field" in
+    ".keyString") value=$(echo "$json" | sed -n 's/.*"keyString": *"\([^"]*\)".*/\1/p');;
+    *) local field_name=$(echo "$field" | tr -d '.["]'); value=$(echo "$json" | grep -oP "(?<=\"$field_name\":\s*\")[^\"]*");;
+  esac
+  if [ -n "$value" ]; then echo "$value"; return 0; else return 1; fi
 }
 
-# ========================== 原子写入密钥 ===========================
-write_key() {
-  local api_key="$1"
-  [ -z "$api_key" ] && return 0
-  # 目录锁 (原子 mkdir)
-  while ! mkdir "$TEMP_DIR/keys.lock" 2>/dev/null; do sleep 0.02; done
-  {
-    printf '%s\n' "$api_key" >> "$PURE_KEY_FILE"
-    # 逗号分隔文件按需追加逗号
-    if [ -s "$COMMA_SEPARATED_KEY_FILE" ]; then printf ',' >> "$COMMA_SEPARATED_KEY_FILE"; fi
-    printf '%s' "$api_key" >> "$COMMA_SEPARATED_KEY_FILE"
-  }
-  rmdir "$TEMP_DIR/keys.lock" 2>/dev/null || true
+write_keys_to_files() {
+    local api_key="$1"
+    if [ -z "$api_key" ]; then return; fi
+    (
+        flock 200
+        echo "$api_key" >> "$PURE_KEY_FILE"
+        if [[ -s "$COMMA_SEPARATED_KEY_FILE" ]]; then echo -n "," >> "$COMMA_SEPARATED_KEY_FILE"; fi
+        echo -n "$api_key" >> "$COMMA_SEPARATED_KEY_FILE"
+    ) 200>"${TEMP_DIR}/key_files.lock"
 }
 
-# ========================== 重试 & 回退 ===========================
 retry_with_backoff() {
-  local max_attempts=$1; shift
-  local attempt=1
-  local delay=5
-  local cmd=("$@")
-  local stderr_file
-  stderr_file=$(mktemp -p "$TEMP_DIR" retry_stderr.XXXX)
+  local max_attempts=$1; local cmd=$2; local attempt=1; local timeout=5; local error_log="${TEMP_DIR}/error_$RANDOM.log"
   while [ $attempt -le $max_attempts ]; do
-    if "${cmd[@]}" 2>"$stderr_file"; then
-      rm -f "$stderr_file"
-      return 0
+    if bash -c "$cmd" 2>"$error_log"; then rm -f "$error_log"; return 0; fi
+    local error_msg=$(cat "$error_log")
+    if [[ "$error_msg" == *"Permission denied"* || "$error_msg" == *"Authentication failed"* ]]; then
+        log "ERROR" "权限或认证错误，停止重试。"; rm -f "$error_log"; return 1;
     fi
-    local err
-    err=$(cat "$stderr_file")
-    if [[ "$err" == *"Permission denied"* || "$err" == *"Authentication failed"* || "$err" == *"forbidden"* ]]; then
-      log ERROR "权限/认证错误, 停止重试: ${cmd[*]}"
-      rm -f "$stderr_file"
-      return 1
-    fi
-    if [ $attempt -lt $max_attempts ]; then
-      local jitter=$((RANDOM % 3))
-      log WARN "命令失败(第 $attempt/$max_attempts 次): ${cmd[*]} -> $err | ${delay}s 后重试 (含抖动+$jitter)"
-      sleep $((delay + jitter))
-      delay=$((delay * 2))
-    fi
+    if [ $attempt -lt $max_attempts ]; then sleep $timeout; timeout=$((timeout * 2)); fi
     attempt=$((attempt + 1))
   done
-  log ERROR "命令最终失败(共 $max_attempts 次): ${cmd[*]} | 最终错误: $(cat "$stderr_file")"
-  rm -f "$stderr_file"
-  return 1
+  log "ERROR" "命令在 $max_attempts 次尝试后最终失败。最后错误: $(cat "$error_log")"; rm -f "$error_log"; return 1
 }
 
-# ========================== 项目 ID 生成 ===========================</<<"$json")>
-# 生成 TOTAL_PROJECTS 个唯一项目 ID (尽量满足 GCP 规则: 小写字母开头, 长度<=30, 允许 a-z0-9-)
-make_project_ids() {
-  local i id base padded
-  local arr=()
-  for i in $(seq 1 "$TOTAL_PROJECTS"); do
-    padded=$(printf '%03d' "$i")
-    base="${PROJECT_PREFIX}-${EMAIL_USERNAME}-${padded}"
-    id=$(echo "$base" | tr -cd 'a-z0-9-' | cut -c1-30 | sed 's/-$//')
-    # 确保首字符为字母
-    if ! [[ $id =~ ^[a-z] ]]; then
-      id="g${id}"; id=$(echo "$id" | cut -c1-30 | sed 's/-$//')
-    fi
-    arr+=("$id")
-  done
-  printf '%s\n' "${arr[@]}"
+
+generate_report() {
+  local success=$1; local attempted=$2
+  local failed=$((attempted - success))
+  echo ""; echo "========== 执行报告 =========="
+  echo "计划目标: $attempted 个项目"
+  echo "成功获取密钥: $success 个"
+  echo "失败: $failed 个"
+  echo "API密钥已保存至:"
+  echo "- 每行一个: $PURE_KEY_FILE"
+  echo "- 逗号分隔: $COMMA_SEPARATED_KEY_FILE"
+  echo "=========================="
 }
 
-# ========================== 任务函数 ===========================
-# 所有任务函数: 成功返回 0, 失败返回非 0
-
-create_project_task() {
-  local project_id="$1"; local success_file="$2"
-  if gcloud projects describe "$project_id" >/dev/null 2>&1; then
-    log WARN "项目已存在 (跳过创建): $project_id"
-    echo "$project_id" >> "$success_file"
-    return 0
-  fi
-  if gcloud projects create "$project_id" --name="$project_id" --no-set-as-default --quiet >/dev/null 2>&1; then
-    echo "$project_id" >> "$success_file"
-    return 0
-  else
-    log ERROR "创建项目失败: $project_id"
-    return 1
-  fi
-}
-
-enable_api_task() {
-  local project_id="$1"; local success_file="$2"
-  if retry_with_backoff "$MAX_RETRY_ATTEMPTS" gcloud services enable "$API_NAME" --project="$project_id" --quiet; then
-    echo "$project_id" >> "$success_file"
-    return 0
-  else
-    log ERROR "启用 API 失败: $project_id"
-    return 1
-  fi
-}
-
-create_key_task() {
-  local project_id="$1"; local dummy_file="$2" # dummy_file 占位保持函数签名一致
-  local output
-  if ! output=$(retry_with_backoff "$MAX_RETRY_ATTEMPTS" gcloud services api-keys create\"$1\"; local success_file=\"$2\"\n  if retry_with_backoff \"$MAX_RETRY_ATTEMPTS\" gcloud services enable \"$API_NAME\" --project=\"$project_id\" --quiet; then\n    echo \"$project_id\" >> \"$success_file\"\n    return 0\n  else\n    log ERROR \"启用 API 失败: $project_id\"\n    return 1\n  fi\n}\n\ncreate_key_task() {\n  local project_id=\"$1\"; local dummy_file=\"$2\" # dummy_file 占位保持函数签名一致\n  local output\n  if ! output=$(retry_with_backoff \"$MAX_RETRY_ATTEMPTS\" gcloud services api-keys create \\\n        --project=\"$project_id\" \\\n        --display-name=\"Gemini API Key for $project_id\" \\\: $project_id" >> "$DELETION_LOG"
-    return 0
-  else
-    log ERROR "删除失败: $project_id"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 删除失败: $project_id" >> "$DELETION_LOG"
-    return 1
-  fi
-}
-
-# ========================== 并行调度器 ===========================</=30,>
-# 用法: run_parallel <描述> </描述><任务函数名> </任务函数名><成功记录文件> </成功记录文件><item1> </item1><item2> ...
-run_parallel() {
-  local desc="$1"; shift
-  local task_func="$1"; shift
-  local success_file="$1"; shift
-  local items=("$@")
-  local total=${#items[@]}
-  [ $total -eq 0 ] && log INFO "无任务可执行: $desc" && return 0
-
-  : > "$success_file"
-  local pids=()
-  local started=0 completed=0 success=0 fail=0
-
-  log INFO "开始: $desc (并行度: $MAX_PARALLEL_JOBS, 任务数: $total)"
-  start_heartbeat "$desc 运行中..." 20
-
-  for item in "${items[@]}"; do
-    # 控制并发: 当前运行后台任务数 >= 限制则等待短暂
-    while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "$MAX_PARALLEL_JOBS" ]; do
-      sleep 0.2
-    done
-    ("$task_func" "$item" "$success_file") &
-    pids+=("$!")
-    started=$((started + 1))
-  done
-
-  # 统一收割结果
-  for pid in "${pids[@]}"; do
-    if wait "$pid"; then
-      success=$((success + 1))
+task_create_project() {
+    local project_id="$1"; local success_file="$2"; local error_log="${TEMP_DIR}/create_${project_id}_error.log"
+    if gcloud projects create "$project_id" --name="$project_id" --no-set-as-default --quiet >/dev/null 2>"$error_log"; then
+        (flock 200; echo "$project_id" >> "$success_file";) 200>"${success_file}.lock"
+        rm -f "$error_log"; return 0
     else
-      fail=$((fail + 1))
+        log "ERROR" "创建项目失败: $project_id: $(cat "$error_log")"
+        rm -f "$error_log"; return 1
     fi
-    completed=$((completed + 1))
-    printf "\r%s 进度: %d/%d (成功:%d 失败:%d)" "$desc" "$completed" "$total" "$success" "$fail"
-  done
-  echo
-  stop_heartbeat
-  log INFO "完成: $desc | 成功: $success | 失败: $fail"
-  [ $fail -eq 0 ]
 }
 
-# ========================== 报告函数 ===========================
-report_creation() {
-  local success_keys="$1"; local target="$2"
-  echo
-  echo "========== 执行报告 =========="
-  echo "计划目标: ${target} 个项目"
-  echo "成功获取密钥: ${success_keys} 个"
-  echo "失败: $((target - success_keys)) 个"
-  echo "API 密钥已保存:"
-  echo " - 每行一个: $PURE_KEY_FILE"
-  echo " - 逗号分隔: $COMMA_SEPARATED_KEY_FILE"
-  echo "================================"
-}
-
-report_deletion() {
-  local total="$1"; local duration=$SECONDS
-  local minutes=$((duration / 60)); local seconds=$((duration % 60))
-  echo
-  echo "========== 删除报告 =========="
-  echo "尝试删除: $total 个项目"
-  local succ fail
-  succ=$(grep -c '已删除:' "$DELETION_LOG" 2>/dev/null || echo 0)
-  fail=$(grep -c '删除失败:' "$DELETION_LOG" 2>/dev/null || echo 0)
-  echo "成功删除: $succ"
-  echo "删除失败: $fail"
-  echo "耗时: ${minutes}分${seconds}秒"
-  echo "详细日志: $DELETION_LOG"
-  echo "================================"
-}
-
-# ========================== 核心功能: 创建项目并获取密钥 ===========================
-create_projects_and_get_keys() {
-  SECONDS=0
-  log INFO "任务: 创建 ${TOTAL_PROJECTS} 个项目并获取 API Key (用户名: $EMAIL_USERNAME)"
-  : > "$PURE_KEY_FILE"
-  : > "$COMMA_SEPARATED_KEY_FILE"
-
-  log INFO "生成项目 ID 列表..."</item2>
-  mapfile -t PROJECT_IDS < <(make_project_ids)
-
-  # 阶段 1: 创建项目
-  local CREATED_FILE="$TEMP_DIR/created_projects.txt"; : > "$CREATED_FILE"
-  run_parallel "阶段1: 创建项目" create_project_task "$CREATED_FILE" "${PROJECT_IDS[@]}" || true
-  mapfile -t CREATED_IDS < "$CREATED_FILE" 2>/dev/null || true
-  if [ ${#CREATED_IDS[@]} -eq 0 ]; then
-    log ERROR "项目创建阶段全部失败，终止。"
-    report_creation 0 "$TOTAL_PROJECTS"
-    return 1
-  fi
-
-  # 阶段 2: 全局等待 (可调整或动态探测)
-  log INFO "阶段2: 等待 ${GLOBAL_WAIT_SECONDS}s 以确保项目在后端完全可用..."
-  start_heartbeat "全局等待中..." 10
-  sleep "$GLOBAL_WAIT_SECONDS"
-  stop_heartbeat
-  log INFO "阶段2完成"
-
-  # 阶段 3: 启用 API
-  local ENABLED_FILE="$TEMP_DIR/enabled_projects.txt"; : > "$ENABLED_FILE"
-  run_parallel "阶段3: 启用 API (${API_NAME})" enable_api_task "$ENABLED_FILE" "${CREATED_IDS[@]}" || true
-  mapfile -t ENABLED_IDS < "$ENABLED_FILE" 2>/dev/null || true
-  if [ ${#ENABLED_IDS[@]} -eq 0 ]; then
-    log ERROR "API 启用阶段失败，无可用项目。"
-    report_creation 0 "$TOTAL_PROJECTS"
-    return 1
-  fi
-
-  # 阶段 4: 创建密钥
-  run_parallel "阶段4: 创建密钥" create_key_task /dev/null "${ENABLED_IDS[@]}" || true
-
-  local SUCCESS_KEYS
-  SUCCESS_KEYS=$(wc -l < "$PURE_KEY_FILE" 2>/dev/null | tr -d ' ' || echo 0)
-  report_creation "$SUCCESS_KEYS" "$TOTAL_PROJECTS"
-  if [ "$SUCCESS_KEYS" -lt "$TOTAL_PROJECTS" ]; then
-    log WARN "有 $((TOTAL_PROJECTS - SUCCESS_KEYS)) 个项目未获取到密钥，请查看日志。"
-  fi
-  log SUCCESS "任务完成。耗时: ${SECONDS}s"
-}
-
-# ========================== 删除所有项目 ===========================
-delete_all_projects() {
-  SECONDS=0
-  log WARN "危险操作: 将删除当前账号下所有(非 sys- 前缀)项目"
-  local PROJECT_LIST EC
-  if ! PROJECT_LIST=$(gcloud projects list --format='value(projectId)' --filter='projectId!~^sys-' 2>/dev/null); then
-    log ERROR "获取项目列表失败"
-    return 1
-  fi
-  local arr=()</(make_project_ids)>
-  while IFS= read -r line; do [ -n "$line" ] && arr+=("$line"); done <<<"$PROJECT_LIST"
-  local total=${#arr[@]}
-  if [ $total -eq 0 ]; then
-    log INFO "没有可删除的用户项目。"
-    return 0
-  fi
-  if ! $AUTO_CONFIRM_DELETE; then
-    read -r -p "确认删除全部 $total 个项目? 输入 'DELETE-ALL' 继续: " confirm
-    if [ "$confirm" != "DELETE-ALL" ]; then
-      log INFO "删除操作已取消。"
-      return 1
+task_enable_api() {
+    local project_id="$1"; local success_file="$2"; local error_log="${TEMP_DIR}/enable_${project_id}_error.log"
+    if retry_with_backoff $MAX_RETRY_ATTEMPTS "gcloud services enable generativelanguage.googleapis.com --project=\"$project_id\" --quiet 2>\"$error_log\""; then
+        (flock 200; echo "$project_id" >> "$success_file";) 200>"${success_file}.lock"
+        rm -f "$error_log"; return 0
+    else
+        log "ERROR" "启用API失败: $project_id: $(cat "$error_log")"
+        rm -f "$error_log"; return 1
     fi
+}
+
+task_create_key() {
+    local project_id="$1"; local error_log="${TEMP_DIR}/key_${project_id}_error.log"; local create_output
+    if ! create_output=$(retry_with_backoff $MAX_RETRY_ATTEMPTS "gcloud services api-keys create --project=\"$project_id\" --display-name=\"Gemini API Key for $project_id\" --format=\"json\" --quiet 2>\"$error_log\""); then
+        log "ERROR" "创建密钥失败: $project_id: $(cat "$error_log")"
+        rm -f "$error_log"; return 1
+    fi
+    local api_key; api_key=$(parse_json "$create_output" ".keyString")
+    if [ -n "$api_key" ]; then
+        write_keys_to_files "$api_key"; rm -f "$error_log"; return 0
+    else
+        log "ERROR" "提取密钥失败: $project_id (无法从gcloud输出解析keyString)"
+        rm -f "$error_log"; return 1
+    fi
+}
+
+delete_project() {
+  local project_id="$1"; local error_log="${TEMP_DIR}/delete_${project_id}_error.log"
+  if gcloud projects delete "$project_id" --quiet 2>"$error_log"; then
+    log "SUCCESS" "成功删除项目: $project_id"
+    ( flock 201; echo "[$(date '+%Y-%m-%d %H:%M:%S')] 已删除: $project_id" >> "$DELETION_LOG"; ) 201>"${TEMP_DIR}/${DELETION_LOG}.lock"
+    rm -f "$error_log"; return 0
+  else
+    log "ERROR" "删除项目失败: $project_id: $(cat "$error_log")"
+    ( flock 201; echo "[$(date '+%Y-%m-%d %H:%M:%S')] 删除失败: $project_id - $(cat "$error_log")" >> "$DELETION_LOG"; ) 201>"${TEMP_DIR}/${DELETION_LOG}.lock"
+    rm -f "$error_log"; return 1
   fi
-  echo "项目删除日志 ($(date +%Y-%m-%d_%H:%M:%S))" > "$DELETION_LOG"
-  echo "--------------------------------" >> "$DELETION_LOG"
-  run_parallel "删除项目" delete_project_task /dev/null "${arr[@]}" || true
-  report_deletion "$total"
 }
 
-# ========================== 配置交互 (菜单内) ===========================
-configure_settings() {
-  while true; do
-    clear
-    echo "================ 配置参数 ================"
-    echo "1. 项目创建数量: $TOTAL_PROJECTS"
-    echo "2. 项目前缀: $PROJECT_PREFIX"
-    echo "3. 最大并行任务数: $MAX_PARALLEL_JOBS"
-    echo "4. 最大重试次数: $MAX_RETRY_ATTEMPTS"
-    echo "5. 全局等待时间(秒): $GLOBAL_WAIT_SECONDS"
-    echo "0. 返回"
-    echo "=========================================="
-    read -r -p "选择要修改的设置 [0-5]: " opt
-    case "$opt" in
-      1) read -r -p "输入项目数量(1-75): " val; [[ "$val" =~ ^[1-9][0-9]*$ ]] && [ "$val" -le 200 ] && TOTAL_PROJECTS=$val ;;</<<"$PROJECT_LIST">
-      2) read -r -p "输入项目前缀(字母开头, <=20, a-z0-9-): " val; [[ "$val" =~ ^[a-z][a-z0-9-]{0,19}$ ]] && PROJECT_PREFIX=$val ;;
-      3) read -r -p "输入并行数(1-40): " val; [[ "$val" =~ ^[1-9][0-9]*$ ]] && [ "$val" -le 100 ] && MAX_PARALLEL_JOBS=$val ;;
-      4) read -r -p "输入最大重试(1-10): " val; [[ "$val" =~ ^[1-9][0-9]*$ ]] && [ "$val" -le 10 ] && MAX_RETRY_ATTEMPTS=$val ;;
-      5) read -r -p "输入全局等待秒数(10-300): " val; [[ "$val" =~ ^[1-9][0-9]*$ ]] && [ "$val" -le 300 ] && GLOBAL_WAIT_SECONDS=$val ;;
-      0) return ;;
-      *) echo "无效选项"; sleep 1 ;;
-    esac
-  done
+cleanup_resources() {
+  log "INFO" "执行退出清理..."; if [ -d "$TEMP_DIR" ]; then rm -rf "$TEMP_DIR"; fi
+}
+# ===== 工具函数结束 =====
+
+# ===== 功能模块 =====
+run_parallel() {
+    local task_func="$1"; local description="$2"; local success_file="$3"; shift 3; local items=("$@")
+    local total_items=${#items[@]}; if [ $total_items -eq 0 ]; then log "INFO" "在 '$description' 阶段没有项目需要处理。"; return 0; fi
+    local active_jobs=0; local completed_count=0; local success_count=0; local fail_count=0; local pids=()
+    log "INFO" "开始并行执行 '$description' (最多 $MAX_PARALLEL_JOBS 个并行)..."
+    
+    # 启动心跳，每15秒输出一次状态
+    start_heartbeat "$description 阶段正在进行中..." 15
+    for item in "${items[@]}"; do
+        "$task_func" "$item" "$success_file" &
+        pids+=($!); ((active_jobs++))
+        if [[ "$active_jobs" -ge "$MAX_PARALLEL_JOBS" ]]; then wait -n; ((active_jobs--)); fi
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid"; local exit_status=$?; ((completed_count++))
+        if [ $exit_status -eq 0 ]; then ((success_count++)); else ((fail_count++)); fi
+        echo -n -e "\r$description 中 (完成: $completed_count/$total_items, 成功: $success_count, 失败: $fail_count)..."
+    done
+    echo; log "INFO" "阶段 '$description' 完成。成功: $success_count, 失败: $fail_count"
+    log "INFO" "======================================================"
+    
+    # 停止心跳
+    stop_heartbeat
+    
+    if [ $fail_count -gt 0 ]; then return 1; else return 0; fi
 }
 
-# ========================== 主菜单 ===========================
+create_projects_and_get_keys_fast() {
+    SECONDS=0
+    log "INFO" "======================================================"
+    log "INFO" "任务: 创建固定的 $TOTAL_PROJECTS 个项目并获取API密钥"
+    log "INFO" "======================================================"
+    ### MODIFICATION ###: Quota check is removed.
+    log "INFO" "使用随机生成的用户名: ${EMAIL_USERNAME}"
+    log "INFO" "在 3 秒后开始执行..."; sleep 3
+
+    > "$PURE_KEY_FILE"; > "$COMMA_SEPARATED_KEY_FILE"
+    local projects_to_create=()
+    for i in $(seq 1 $TOTAL_PROJECTS); do
+        local project_num=$(printf "%03d" $i)
+        local base_id="${PROJECT_PREFIX}-${EMAIL_USERNAME}-${project_num}"
+        local project_id=$(echo "$base_id" | tr -cd 'a-z0-9-' | cut -c 1-30 | sed 's/-$//')
+        if ! [[ "$project_id" =~ ^[a-z] ]]; then project_id="g${project_id:1}"; project_id=$(echo "$project_id" | cut -c 1-30 | sed 's/-$//'); fi
+        projects_to_create+=("$project_id")
+    done
+
+    # --- PHASE 1: Create Projects ---
+    local CREATED_PROJECTS_FILE="${TEMP_DIR}/created_projects.txt"; > "$CREATED_PROJECTS_FILE"
+    export -f task_create_project log retry_with_backoff; export TEMP_DIR MAX_RETRY_ATTEMPTS
+    run_parallel task_create_project "阶段1: 创建项目" "$CREATED_PROJECTS_FILE" "${projects_to_create[@]}"
+    local created_project_ids=(); if [ -f "$CREATED_PROJECTS_FILE" ]; then mapfile -t created_project_ids < "$CREATED_PROJECTS_FILE"; fi
+    if [ ${#created_project_ids[@]} -eq 0 ]; then log "ERROR" "项目创建阶段失败，没有任何项目成功创建。中止操作。"; return 1; fi
+
+    # --- PHASE 2: Global Wait ---
+    log "INFO" "阶段2: 全局等待 ${GLOBAL_WAIT_SECONDS} 秒，以便GCP后端同步项目状态..."
+    
+    # 启动心跳，每10秒输出一次状态
+    start_heartbeat "阶段2: 全局等待进行中..." 10
+    
+    # 等待指定时间
+    sleep ${GLOBAL_WAIT_SECONDS}
+    
+    # 停止心跳
+    stop_heartbeat
+    
+    echo; log "INFO" "等待完成。"; log "INFO" "======================================================"
+
+    # --- PHASE 3: Enable APIs ---
+    local ENABLED_PROJECTS_FILE="${TEMP_DIR}/enabled_projects.txt"; > "$ENABLED_PROJECTS_FILE"
+    export -f task_enable_api log retry_with_backoff; export TEMP_DIR MAX_RETRY_ATTEMPTS
+    run_parallel task_enable_api "阶段3: 启用API" "$ENABLED_PROJECTS_FILE" "${created_project_ids[@]}"
+    local enabled_project_ids=(); if [ -f "$ENABLED_PROJECTS_FILE" ]; then mapfile -t enabled_project_ids < "$ENABLED_PROJECTS_FILE"; fi
+    if [ ${#enabled_project_ids[@]} -eq 0 ]; then log "ERROR" "API启用阶段失败，没有任何项目成功启用API。中止操作。"; generate_report 0 $TOTAL_PROJECTS; return 1; fi
+
+    # --- PHASE 4: Create Keys ---
+    export -f task_create_key log retry_with_backoff parse_json write_keys_to_files; export TEMP_DIR MAX_RETRY_ATTEMPTS PURE_KEY_FILE COMMA_SEPARATED_KEY_FILE
+    run_parallel task_create_key "阶段4: 创建密钥" "/dev/null" "${enabled_project_ids[@]}"
+
+    # --- FINAL REPORT ---
+    local successful_keys=$(wc -l < "$PURE_KEY_FILE" | xargs)
+    generate_report "$successful_keys" "$TOTAL_PROJECTS"
+    log "INFO" "======================================================"
+    log "INFO" "请检查文件 '$PURE_KEY_FILE' 和 '$COMMA_SEPARATED_KEY_FILE' 中的内容"
+    if [ "$successful_keys" -lt "$TOTAL_PROJECTS" ]; then log "WARN" "有 $((TOTAL_PROJECTS - successful_keys)) 个项目未能成功获取密钥，请检查上方日志了解详情。"; fi
+    log "INFO" "本脚本原版作者类脑@momo & @ddddd1996, 修改版作者类脑@KKTsN, 感谢您的使用"
+    log "INFO" "======================================================"
+}
+
+delete_all_existing_projects() {
+  SECONDS=0
+  log "INFO" "======================================================"; log "INFO" "功能2: 删除所有现有项目"; log "INFO" "======================================================"
+  log "INFO" "正在获取项目列表..."; local list_error="${TEMP_DIR}/list_projects_error.log"; local ALL_PROJECTS=($(gcloud projects list --format="value(projectId)" --filter="projectId!~^sys-" --quiet 2>"$list_error")); local list_ec=$?; rm -f "$list_error"
+  if [ $list_ec -ne 0 ]; then log "ERROR" "无法获取项目列表: $(cat "$list_error")"; return 1; fi
+  if [ ${#ALL_PROJECTS[@]} -eq 0 ]; then log "INFO" "未找到任何用户项目，无需删除"; return 0; fi
+  local total_to_delete=${#ALL_PROJECTS[@]}
+  log "INFO" "找到 $total_to_delete 个用户项目需要删除";
+  read -p "!!! 危险操作 !!! 确认要删除所有 $total_to_delete 个项目吗？(输入 'DELETE-ALL' 确认): " confirm; if [ "$confirm" != "DELETE-ALL" ]; then log "INFO" "删除操作已取消"; return 1; fi
+  echo "项目删除日志 ($(date +%Y-%m-%d_%H:%M:%S))" > "$DELETION_LOG"; echo "------------------------------------" >> "$DELETION_LOG"
+  export -f delete_project log retry_with_backoff; export DELETION_LOG TEMP_DIR MAX_PARALLEL_JOBS MAX_RETRY_ATTEMPTS
+  run_parallel delete_project "删除项目" "/dev/null" "${ALL_PROJECTS[@]}"
+  local successful_deletions=$(grep -c "成功删除项目:" "$DELETION_LOG")
+  local failed_deletions=$(grep -c "删除项目失败:" "$DELETION_LOG")
+  local duration=$SECONDS; local minutes=$((duration / 60)); local seconds_rem=$((duration % 60))
+  echo ""; echo "========== 删除报告 =========="; echo "总计尝试删除: $total_to_delete 个项目"; echo "成功删除: $successful_deletions 个项目"; echo "删除失败: $failed_deletions 个项目"; echo "总执行时间: $minutes 分 $seconds_rem 秒"; echo "详细日志已保存至: $DELETION_LOG"; echo "=========================="
+}
+
 show_menu() {
   clear
-  cat <<'BANNER'
-   ______   ______   ____     __  __           __
-  / ____/  / ____/  / __ \   / / / /  ___     / /  ____     ___     _____
- / / __   / /      / /_/ /  / /_/ /  / _ \   / /  / __ \   / _ \   / ___/
-/ /_/ /  / /___   / ____/  / __  /  /  __/  / /  / /_/ /  /  __/  / /
-\____/   \____/  /_/      /_/ /_/   \___/  /_/  / .___/   \___/  /_/
-                                              /_/
-BANNER
-  echo "GCP 项目 & 密钥管理工具 (v1.2)"
+  echo "   ______   ______   ____     __  __           __                        "
+  echo "  / ____/  / ____/  / __ \   / / / /  ___     / /  ____     ___     _____"
+  echo " / / __   / /      / /_/ /  / /_/ /  / _ \   / /  / __ \   / _ \   / ___/"
+  echo "/ /_/ /  / /___   / ____/  / __  /  /  __/  / /  / /_/ /  /  __/  / /    "
+  echo "\____/   \____/  /_/      /_/ /_/   \___/  /_/  / .___/   \___/  /_/     "
+  echo "                                               /_/                            "             
+  echo "GCP 项目&密钥管理工具 修改版 v1.1 By momo & ddddd1996 & KKTsN"
   echo "======================================================"
-  local current_account current_project
-  current_account=$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null | head -n1)
-  current_project=$(gcloud config get-value project 2>/dev/null || echo '未设置')
-  [ -z "$current_account" ] && current_account='无法获取'
-  echo "当前账号: $current_account"
-  echo "默认项目: $current_project"
-  echo "固定创建数量: $TOTAL_PROJECTS"
-  echo "并行任务数: $MAX_PARALLEL_JOBS"
-  echo "全局等待: ${GLOBAL_WAIT_SECONDS}s"
-  echo "重试次数: $MAX_RETRY_ATTEMPTS"
-  echo "======================================================"
-  echo "1. 创建 ${TOTAL_PROJECTS} 个项目并获取 API Key"
-  echo "2. 删除所有现有项目"
+  local current_account; current_account=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null | head -n 1); if [ -z "$current_account" ]; then current_account="无法获取"; fi
+  local current_project; current_project=$(gcloud config get-value project 2>/dev/null); if [ -z "$current_project" ]; then current_project="未设置"; fi
+  echo "当前账号: $current_account"; echo "当前项目: $current_project"
+  echo "固定创建数量: $TOTAL_PROJECTS"; echo "并行任务数: $MAX_PARALLEL_JOBS"; echo "全局等待: ${GLOBAL_WAIT_SECONDS}s"
+  echo ""; echo "请选择功能:";
+  echo "1. 一键创建${TOTAL_PROJECTS}个项目并获取API密钥"
+  echo "2. 一键删除所有现有项目"
   echo "3. 修改配置参数"
   echo "0. 退出"
   echo "======================================================"
-  read -r -p "请选择 [0-3]: " choice
-  case "$choice" in
-    1) create_projects_and_get_keys ;;
-    2) delete_all_projects ;;
+  read -p "请输入选项 [0-3]: " choice
+
+  case $choice in
+    1) create_projects_and_get_keys_fast ;;
+    2) delete_all_existing_projects ;;
     3) configure_settings ;;
-    0) log INFO "退出"; exit 0 ;;
-    *) echo "无效选项"; sleep 1 ;;
+    0) log "INFO" "正在退出..."; exit 0 ;;
+    *) echo "无效选项 '$choice'，请重新选择。"; sleep 2 ;;
   esac
-  read -r -p "按回车返回菜单..." _
+  if [[ "$choice" =~ ^[1-3]$ ]]; then echo ""; read -p "按回车键返回主菜单..."; fi
 }
 
-# ========================== CLI 参数解析 ===========================
-print_help() {
-  cat <<EOF
-用法: $0 [选项]
-
-选项 (可与菜单交互二选一):
-  --create              非交互模式: 直接批量创建项目并获取密钥
-  --delete              非交互模式: 删除所有项目
-  -c, --count N         创建项目数量 (覆盖默认 $TOTAL_PROJECTS)
-  -j, --jobs N          最大并行任务数 (默认 $MAX_PARALLEL_JOBS)
-  -w, --wait N          全局等待秒数 (默认 $GLOBAL_WAIT_SECONDS)
-  -r, --retries N       最大重试次数 (默认 $MAX_RETRY_ATTEMPTS)
-  -p, --prefix STR      项目前缀 (默认 $PROJECT_PREFIX)
-  -y, --yes             删除操作自动确认
-  --no-color            禁用彩色输出 (等同于 NO_COLOR=1)
-  -h, --help            显示帮助
-
-示例:
-  $0 --create -c 50 -j 20 -w 90
-  NO_COLOR=1 $0 --delete --yes
-EOF
-}
-
-parse_cli() {
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --create) NON_INTERACTIVE_ACTION="create"; shift ;;
-      --delete) NON_INTERACTIVE_ACTION="delete"; shift ;;
-      -c|--count) TOTAL_PROJECTS=$2; shift 2 ;;
-      -j|--jobs) MAX_PARALLEL_JOBS=$2; shift 2 ;;
-      -w|--wait) GLOBAL_WAIT_SECONDS=$2; shift 2 ;;
-      -r|--retries) MAX_RETRY_ATTEMPTS=$2; shift 2 ;;
-      -p|--prefix) PROJECT_PREFIX=$2; shift 2 ;;
-      -y|--yes) AUTO_CONFIRM_DELETE=true; shift ;;
-      --no-color) NO_COLOR=1; shift ;;
-      -h|--help) print_help; exit 0 ;;
-      *) log WARN "忽略未知参数: $1"; shift ;;
-    esac
+configure_settings() {
+  while true; do
+      clear; echo "======================================================"; echo "配置参数"; echo "======================================================"
+      echo "当前设置:";
+      echo "1. 项目创建数量: $TOTAL_PROJECTS"
+      echo "2. 项目前缀 (用于新建项目): $PROJECT_PREFIX"
+      echo "3. 最大并行任务数: $MAX_PARALLEL_JOBS"
+      echo "4. 最大重试次数 (用于API调用): $MAX_RETRY_ATTEMPTS"
+      echo "5. 全局等待时间 (秒): $GLOBAL_WAIT_SECONDS"
+      echo "0. 返回主菜单"
+      echo "======================================================"
+      ### MODIFICATION ###: Added TOTAL_PROJECTS configuration option
+      read -p "请选择要修改的设置 [0-5]: " setting_choice
+      case $setting_choice in
+        1) read -p "输入项目创建数量 (1-75，留空取消): " new_total; if [[ "$new_total" =~ ^[1-9][0-9]*$ ]] && [ "$new_total" -le 100 ]; then TOTAL_PROJECTS=$new_total; echo "项目创建数量已设置为: $TOTAL_PROJECTS"; sleep 2; fi ;;
+        2) read -p "输入新的项目前缀 (留空取消): " new_prefix; if [ -n "$new_prefix" ]; then if [[ "$new_prefix" =~ ^[a-z][a-z0-9-]{0,19}$ ]]; then PROJECT_PREFIX="$new_prefix"; echo "项目前缀已设置为: $PROJECT_PREFIX"; sleep 2; fi; fi ;;
+        3) read -p "输入最大并行任务数 (20-40，留空取消): " new_parallel; if [[ "$new_parallel" =~ ^[1-9][0-9]*$ ]]; then MAX_PARALLEL_JOBS=$new_parallel; echo "最大并行任务数已设置为: $MAX_PARALLEL_JOBS"; sleep 2; fi ;;
+        4) read -p "输入最大重试次数 (1-5，留空取消): " new_retries; if [[ "$new_retries" =~ ^[1-9][0-9]*$ ]]; then MAX_RETRY_ATTEMPTS=$new_retries; echo "最大重试次数已设置为: $MAX_RETRY_ATTEMPTS"; sleep 2; fi ;;
+        5) read -p "输入全局等待时间 (建议 60-120, 留空取消): " new_wait; if [[ "$new_wait" =~ ^[1-9][0-9]*$ ]]; then GLOBAL_WAIT_SECONDS=$new_wait; echo "全局等待时间已设置为: $GLOBAL_WAIT_SECONDS 秒"; sleep 2; fi ;;
+        0) return ;;
+        *) echo "无效选项 '$setting_choice'，请重新选择"; sleep 2 ;;
+      esac
   done
 }
 
-# ========================== 主流程 ===========================
-main() {
-  parse_cli "$@"
-  preflight_checks
-  log INFO "用户名随机片段: $EMAIL_USERNAME"
-  log INFO "配置: 数量=$TOTAL_PROJECTS 并行=$MAX_PARALLEL_JOBS 等待=${GLOBAL_WAIT_SECONDS}s 重试=$MAX_RETRY_ATTEMPTS 前缀=$PROJECT_PREFIX"
-
-  case "$NON_INTERACTIVE_ACTION" in
-    create)
-      create_projects_and_get_keys
-      return
-      ;;
-    delete)
-      delete_all_projects
-      return
-      ;;
-    "")
-      # 交互模式
-      while true; do
-        show_menu
-      done
-      ;;
-  esac
-}
-
-main "$@"
-
-# 结束</=20,>
+# ===== 主程序 =====
+trap 'stop_heartbeat; cleanup_resources' EXIT SIGINT SIGTERM
+log "INFO" "检查 GCP 登录状态..."; if ! gcloud auth list --filter=status:ACTIVE --format="value(account)" >/dev/null; then log "WARN" "无法获取活动账号信息，请尝试登录:"; if ! gcloud auth login; then log "ERROR" "登录失败。"; exit 1; fi; fi; log "INFO" "GCP 账号检查通过。"
+log "INFO" "检查 GCP 项目配置..."; if ! gcloud config get-value project >/dev/null; then log "WARN" "尚未设置默认GCP项目。建议使用 'gcloud config set project YOUR_PROJECT_ID' 设置。"; sleep 3; else log "INFO" "GCP 项目配置检查完成。"; fi
+while true; do show_menu; done
